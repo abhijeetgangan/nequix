@@ -420,6 +420,8 @@ def train(config_path: str):
             config["loss_type"],
         )
 
+        os.makedirs(wandb.run.dir, exist_ok=True)
+
         if val_metrics["loss"] < best_val_loss:
             best_val_loss = val_metrics["loss"]
             save_model(Path(wandb.run.dir) / "checkpoint.nqx", ema_model_single, config)
