@@ -190,6 +190,20 @@ def train(config_path: str):
         train_dataset, val_dataset = train_dataset.split(valid_frac=config["valid_frac"])
     else:
         assert "valid_path" in config, "valid_path must be specified if valid_frac is not provided"
+
+    if isinstance(config["valid_path"], list):
+        val_dataset = ConcatDataset(
+            [
+                AseDBDataset(
+                    file_path=path,
+                    atomic_numbers=config["atomic_numbers"],
+                    cutoff=config["cutoff"],
+                    backend="jax",
+                )
+                for path in config["valid_path"]
+            ]
+        )
+    else:
         val_dataset = AseDBDataset(
             file_path=config["valid_path"],
             atomic_numbers=config["atomic_numbers"],
