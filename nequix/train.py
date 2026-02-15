@@ -279,10 +279,11 @@ def train(config_path: str):
         kernel=config["kernel"],
     )
     if "finetune_from" in config and Path(config["finetune_from"]).exists():
-        if "atom_energies" in config:
-            # TODO
-            raise NotImplementedError("Updating atom energies not implemented for JAX backend")
         model, _ = load_model(config["finetune_from"])
+        if "atom_energies" in config:
+            model = eqx.tree_at(
+                lambda m: m.atom_energies, model, jnp.array(atom_energies, dtype=jnp.float32)
+            )
 
     param_count = sum(p.size for p in jax.tree.flatten(eqx.filter(model, eqx.is_array))[0])
 
