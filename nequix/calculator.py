@@ -13,10 +13,63 @@ from nequix.data import (
     dict_to_pytorch_geometric,
     preprocess_graph,
 )
-
-
 from nequix.model import load_model as load_model_jax
 from nequix.model import save_model as save_model_jax
+from nequix.pft.hessian import hessian_linearized
+
+
+def from_pretrained(
+    model_name: str = None, model_path: str = None, backend: str = "jax", use_kernel: bool = True
+):
+    """Load a pretrained Nequix model from the cache, checkpoint path, or download it if necessary."""
+    assert backend in ["jax", "torch"], f"invalid backend: {backend}"
+    base_path = Path("~/.cache/nequix/models/").expanduser()
+    ext_for_backend = "nqx" if backend == "jax" else "pt"
+
+    if model_path is not None:
+        model_path = Path(model_path)
+    else:
+        # attempt to load checkpoint with desired backend
+        model_path = base_path / f"{model_name}.{ext_for_backend}"
+        if not model_path.exists():
+            # otherwise use nqx checkpoint
+            model_path = base_path / f"{model_name}.nqx"
+            if not model_path.exists():
+                # download if necessary
+                assert model_name in NequixCalculator.URLS, f"invalid model name: {model_name}"
+                model_path.parent.mkdir(parents=True, exist_ok=True)
+                urllib.request.urlretrieve(NequixCalculator.URLS[model_name], model_path)
+
+    path_backend = "jax" if model_path.suffix == ".nqx" else "torch"
+    if path_backend == backend:
+        if backend == "jax":
+            model, config = load_model_jax(model_path, use_kernel)
+        else:
+            from nequix.torch_impl.model import load_model as load_model_torch
+
+            model, config = load_model_torch(model_path, use_kernel)
+    else:
+        # Convert and save
+        if path_backend == "torch":
+            from nequix.torch_impl.utils import convert_model_torch_to_jax
+
+            torch_model, torch_config = load_model_torch(model_path, use_kernel)
+            print("Converting PyTorch model to JAX ...")
+            model, config = convert_model_torch_to_jax(torch_model, torch_config, use_kernel)
+            out_path = model_path.parent / f"{model_name}.nqx"
+            save_model_jax(out_path, model, config)
+        else:
+            from nequix.torch_impl.utils import convert_model_jax_to_torch
+
+            jax_model, jax_config = load_model_jax(model_path, use_kernel)
+            print("Converting JAX model to PyTorch ...")
+            model, config = convert_model_jax_to_torch(jax_model, jax_config, use_kernel)
+            out_path = model_path.parent / f"{model_name}.pt"
+            from nequix.torch_impl.model import save_model as save_model_torch
+
+            save_model_torch(out_path, model, config)
+        print("Model saved to ", out_path)
+    return model, config
 
 
 class NequixCalculator(Calculator):
@@ -46,7 +99,7 @@ class NequixCalculator(Calculator):
         capacity_multiplier: float = 1.1,  # Only for jax backend
         backend: str = "jax",
         use_kernel: bool = True,
-        use_compile: bool = True,  # Only for torch backend
+        use_compile: bool = False,  # Only for torch backend
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -56,55 +109,7 @@ class NequixCalculator(Calculator):
 
             assert torch.cuda.is_available(), "Kernels need GPU environment"
 
-        base_path = Path("~/.cache/nequix/models/").expanduser()
-        ext_for_backend = "nqx" if backend == "jax" else "pt"
-
-        if model_path is not None:
-            model_path = Path(model_path)
-        else:
-            # attempt to load checkpoint with desired backend
-            model_path = base_path / f"{model_name}.{ext_for_backend}"
-            if not model_path.exists():
-                # otherwise use nqx checkpoint
-                model_path = base_path / f"{model_name}.nqx"
-                if not model_path.exists():
-                    # download if necessary
-                    model_path.parent.mkdir(parents=True, exist_ok=True)
-                    urllib.request.urlretrieve(self.URLS[model_name], model_path)
-
-        path_backend = "jax" if model_path.suffix == ".nqx" else "torch"
-        if path_backend == backend:
-            if backend == "jax":
-                self.model, self.config = load_model_jax(model_path, use_kernel)
-            else:
-                from nequix.torch_impl.model import load_model as load_model_torch
-
-                self.model, self.config = load_model_torch(model_path, use_kernel)
-        else:
-            # Convert and save
-            if path_backend == "torch":
-                from nequix.torch_impl.utils import convert_model_torch_to_jax
-
-                torch_model, torch_config = load_model_torch(model_path, use_kernel)
-                print("Converting PyTorch model to JAX ...")
-                self.model, self.config = convert_model_torch_to_jax(
-                    torch_model, torch_config, use_kernel
-                )
-                out_path = model_path.parent / f"{model_name}.nqx"
-                save_model_jax(out_path, self.model, self.config)
-            else:
-                from nequix.torch_impl.utils import convert_model_jax_to_torch
-
-                jax_model, jax_config = load_model_jax(model_path, use_kernel)
-                print("Converting JAX model to PyTorch ...")
-                self.model, self.config = convert_model_jax_to_torch(
-                    jax_model, jax_config, use_kernel
-                )
-                out_path = model_path.parent / f"{model_name}.pt"
-                from nequix.torch_impl.model import save_model as save_model_torch
-
-                save_model_torch(out_path, self.model, self.config)
-            print("Model saved to ", out_path)
+        self.model, self.config = from_pretrained(model_name, model_path, backend, use_kernel)
 
         if backend == "torch":
             import torch
@@ -122,33 +127,33 @@ class NequixCalculator(Calculator):
         self._capacity_multiplier = capacity_multiplier
         self.backend = backend
 
+    def _pad_graph_jax(self, graph, numbers_changed=False):
+        # maintain edge capacity with _capacity_multiplier over edges,
+        # recalculate if numbers (system) changes, or if the capacity is exceeded
+        if self._capacity is None or numbers_changed or graph.n_edge[0] > self._capacity:
+            raw = int(np.ceil(graph.n_edge[0] * self._capacity_multiplier))
+            # round up edges to the nearest multiple of 64
+            # NB: this avoids excessive recompilation in high-throughput
+            # workflows (e.g.  material relaxtions) but this number may need
+            # to be tuned depending on the system sizes
+            self._capacity = ((raw + 63) // 64) * 64
+
+        # round up nodes to the nearest multiple of 8
+        # NB: this avoids excessive recompilation in high-throughput
+        # workflows (e.g. material relaxtions) but this number may need to
+        # be tuned depending on the system sizes
+        n_node = ((graph.n_node[0] + 8) // 8) * 8
+
+        # pad the graph
+        graph = jraph.pad_with_graphs(graph, n_node=n_node, n_edge=self._capacity, n_graph=2)
+        return graph
+
     def calculate(self, atoms=None, properties=None, system_changes=all_changes):
         Calculator.calculate(self, atoms)
         processed_graph = preprocess_graph(atoms, self.atom_indices, self.cutoff, False)
         if self.backend == "jax":
             graph = dict_to_graphstuple(processed_graph)
-            # maintain edge capacity with _capacity_multiplier over edges,
-            # recalculate if numbers (system) changes, or if the capacity is exceeded
-            if (
-                self._capacity is None
-                or ("numbers" in system_changes)
-                or graph.n_edge[0] > self._capacity
-            ):
-                raw = int(np.ceil(graph.n_edge[0] * self._capacity_multiplier))
-                # round up edges to the nearest multiple of 64
-                # NB: this avoids excessive recompilation in high-throughput
-                # workflows (e.g.  material relaxtions) but this number may need
-                # to be tuned depending on the system sizes
-                self._capacity = ((raw + 63) // 64) * 64
-
-            # round up nodes to the nearest multiple of 8
-            # NB: this avoids excessive recompilation in high-throughput
-            # workflows (e.g. material relaxtions) but this number may need to
-            # be tuned depending on the system sizes
-            n_node = ((graph.n_node[0] + 8) // 8) * 8
-
-            # pad the graph
-            graph = jraph.pad_with_graphs(graph, n_node=n_node, n_edge=self._capacity, n_graph=2)
+            graph = self._pad_graph_jax(graph, "numbers" in system_changes)
             energy, forces, stress = eqx.filter_jit(self.model)(graph)
             forces = forces[: len(atoms)]
 
@@ -203,10 +208,23 @@ class NequixCalculator(Calculator):
             )
 
         # take energy and forces without padding
-        energy = np.array(energy[0])
+        energy = energy[0].item()
         self.results["energy"] = energy
         self.results["free_energy"] = energy
         self.results["forces"] = np.array(forces)
         self.results["stress"] = (
             full_3x3_to_voigt_6_stress(np.array(stress[0])) if stress is not None else None
         )
+
+    def get_hessian(self, atoms=None):
+        assert self.backend == "jax", "Hessian calculation currently only supported for JAX backend"
+        if atoms is None and self.atoms is None:
+            raise ValueError("atoms not set")
+        if atoms is None:
+            atoms = self.atoms
+        n_atoms = len(atoms)
+        processed_graph = preprocess_graph(atoms, self.atom_indices, self.cutoff, False)
+        graph = dict_to_graphstuple(processed_graph)
+        graph = self._pad_graph_jax(graph, True)
+        hessian = eqx.filter_jit(hessian_linearized)(self.model, graph)
+        return np.array(hessian[:n_atoms, :n_atoms, :, :], copy=True)

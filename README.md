@@ -24,7 +24,7 @@ to use [OpenEquivariance](https://github.com/PASSIONLab/OpenEquivariance) kernel
 ```bash
 pip install nequix[oeq]
 # needs to be run after installation:
-uv pip install openequivariance_extjax --no-build-isolation
+pip install openequivariance_extjax --no-build-isolation
 ```
 
 or for torch (also with kernels):
@@ -55,6 +55,13 @@ atoms.calc = NequixCalculator("nequix-mp-1", backend="torch")
 
 These are typically comparable in speed with kernels.
 
+Analytical Hessians can be calculated with (currently only supported for JAX backend):
+
+```python
+calc = NequixCalculator("nequix-mp-1", backend="jax")
+calc.get_hessian(atoms)  # np array of shape (n, n, 3, 3)
+```
+
 #### NequixCalculator
 
 Arguments
@@ -73,6 +80,15 @@ configuration file:
 ```bash
 nequix_train <config>.yml
 ```
+
+with kernels
+
+```bash
+uv sync --extra oeq
+uv pip install openequivariance_extjax --no-build-isolation
+nequix_train <config>.yml
+```
+
 or for Torch
 
 ```bash
